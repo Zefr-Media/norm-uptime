@@ -1,31 +1,191 @@
-# Change these first
-owner: upptime # Your GitHub organization or username, where this repository lives
-repo: upptime # The name of this repository
+# ─────────────────────────────────────────────────────────────────────────────
+# THE OFF-PLATFORM DEAD-MAN'S SWITCH (Darren, 2026-09-05).
+#
+# Every watcher the platform has runs INSIDE the platform. The probe lanes in
+# packages/server/src/chat-probe.ts run on the casino Worker's cron; the
+# liveness alarm that watches THOSE lanes (probe-liveness.ts, shipped 09-05)
+# runs on the same cron. So the alarm and the thing it alarms about share a
+# single point of failure: if the casino cron stops, the lanes stop, the
+# liveness alarm stops, and NOTHING reports it. That is the blind spot this
+# file closes, and it is the same shape as the nine-day silence of 2026-08-27
+# — a thing that stops does not fail, and failure is what the alarm watches.
+#
+# The fix cannot be another in-platform watcher; that only moves the blind
+# spot up one level. It has to run somewhere the platform's death cannot
+# reach. This runs on GitHub Actions: different company, different network,
+# different billing relationship, nothing shared with Cloudflare but DNS.
+#
+# HOURLY, NOT THE 5-MINUTE DEFAULT (Darren, 2026-09-05). There are zero real
+# players. Five-minute checks buy detection latency nobody is waiting on and
+# cost twelve times the GitHub Actions minutes — and Actions minutes are
+# themselves an unwatched resource, which is how this platform got here. See
+# `workflowSchedule.uptime` below and the minute arithmetic in SETUP.md.
+#
+# THIS FILE ASSERTS LIVENESS, NOT CORRECTNESS. The in-platform probe already
+# asserts that the board carries events, that a chat turn comes back with
+# text, that a game page returns the game it was asked for. Duplicating those
+# judgements here would put business logic in the one alarm that has to stay
+# believable when everything else is dark. Every check below asks the single
+# question this watcher exists to answer: is anything answering at all?
+# ─────────────────────────────────────────────────────────────────────────────
+
+owner: Zefr-Media
+repo: norm-uptime
+user-agent: Dazzer-Zefr
 
 sites:
-  - name: Google
-    url: https://www.google.com
-  - name: Wikipedia
-    url: https://en.wikipedia.org
-  - name: Hacker News
-    url: https://news.ycombinator.com
-  - name: Secret Site
-    url: $SECRET_SITE
+  # THE FOUR HOSTS, AND WHY /api/build IS THE TRUEST SIGNAL.
+  #
+  # A 200 on `/` proves Cloudflare answered; it does NOT prove the Worker ran,
+  # because Cloudflare serves its own error and challenge pages with a 200 in
+  # some configurations and the SPA shell is static. `/api/build` is served by
+  # the Worker's own router and returns {sha, builtAt} built at deploy time,
+  # so a 200 carrying `"sha"` is proof that THIS Worker, on THIS deploy, is
+  # executing. That is why every check below asserts the body, not the code.
+
+  - name: Sportsbook API
+    url: https://sports.norm.game/api/build
+    # Worker `sportsbook`. Distinct from the casino Worker below — this is the
+    # only monitor that proves the sportsbook Worker itself is alive.
+    expectedStatusCodes: [200]
+    maxResponseTime: 15000
+    headers:
+      - "User-Agent: norm-upptime/1.0 (+https://github.com/Zefr-Media/norm-uptime)"
+      - "Referer: https://sports.norm.game/"
+      - "x-norm-probe: 1"
+    # A 200 whose body has no `"sha"` is an error page wearing a success code.
+    __dangerous__body_down_if_text_missing: '"sha"'
+
+  - name: Sportsbook lines
+    url: https://sports.norm.game/api/lines
+    # One rung above /api/build: this one cannot answer without D1 and the
+    # ingest behind it, so it separates "the Worker is up" from "the data
+    # path is up". It is DELIBERATELY not asserted to be non-empty — an empty
+    # board is a correctness failure and belongs to the in-platform probe,
+    # which already treats it as one. See the header.
+    expectedStatusCodes: [200]
+    # 173KB of JSON, measured at 1.4s from outside Cloudflare on 2026-09-05.
+    # The ceiling is loose on purpose: a `degraded` transition opens an issue
+    # exactly like a `down` one, and a slow board is not an outage.
+    maxResponseTime: 25000
+    headers:
+      - "User-Agent: norm-upptime/1.0 (+https://github.com/Zefr-Media/norm-uptime)"
+      - "Referer: https://sports.norm.game/"
+      - "x-norm-probe: 1"
+    __dangerous__body_down_if_text_missing: '"events"'
+
+  - name: Casino API (www)
+    url: https://www.norm.game/api/build
+    # Worker `norm-app`. www.norm.game and casino.norm.game are two routes on
+    # ONE Worker — verified 2026-09-05, both served sha e07525e with the same
+    # builtAt to the millisecond. Both are monitored anyway, because the
+    # failure they catch separately is a ROUTE or certificate dying on one
+    # hostname while the Worker is perfectly healthy on the other, which no
+    # single check can see. Read them as two hostnames, not two services.
+    expectedStatusCodes: [200]
+    maxResponseTime: 15000
+    headers:
+      - "User-Agent: norm-upptime/1.0 (+https://github.com/Zefr-Media/norm-uptime)"
+      - "Referer: https://www.norm.game/"
+      - "x-norm-probe: 1"
+    __dangerous__body_down_if_text_missing: '"sha"'
+
+  - name: Casino API (casino)
+    url: https://casino.norm.game/api/build
+    expectedStatusCodes: [200]
+    maxResponseTime: 15000
+    headers:
+      - "User-Agent: norm-upptime/1.0 (+https://github.com/Zefr-Media/norm-uptime)"
+      - "Referer: https://casino.norm.game/"
+      - "x-norm-probe: 1"
+    __dangerous__body_down_if_text_missing: '"sha"'
+
+  # admin.norm.game IS DELIBERATELY ABSENT. It sits behind Cloudflare Access,
+  # which answers an unauthenticated caller with a 302 to
+  # white-thunder-9db9.cloudflareaccess.com. That 302 is emitted by Access at
+  # Cloudflare's edge BEFORE the norm-admin Worker is consulted, so a green
+  # check would prove only that Cloudflare Access is up — it would stay green
+  # through a completely dead admin Worker. An assertion that cannot go red
+  # for the thing it names is worse than no assertion, because it occupies
+  # the slot. See PHASE-0 in the report for the two ways to monitor it
+  # properly (an Access service token, or an unprotected /api/build path).
+
+# ─── SCHEDULES ───────────────────────────────────────────────────────────────
+# CORRECTED 2026-09-05. This block used to say it was the single source of
+# truth for the workflow crons, because `update-template` regenerates the
+# workflow files from it. That is no longer how this repository works: the six
+# workflow files in uptime/.github/workflows are HAND-MAINTAINED so they can
+# carry `permissions:` blocks, and the two regenerating workflows are gone.
+#
+# So the cron now lives in TWO places — here, and in the `schedule:` of each
+# workflow file — and nothing keeps them in step. CHANGE BOTH. The workflow
+# file is the one GitHub actually obeys; this block is what the monitor reads
+# and what a future `update-template` would use if anyone ever restored it.
+workflowSchedule:
+  # HOURLY (Darren, 2026-09-05) — the ruling, and the whole reason this repo
+  # is free. See SETUP.md for the arithmetic.
+  #
+  # At :17 rather than :00 on purpose: GitHub queues scheduled workflows
+  # globally and the top of the hour is its most congested minute, where runs
+  # are routinely delayed by tens of minutes or dropped. An off-peak minute is
+  # free and measurably more punctual.
+  uptime: "17 * * * *"
+  # The rest are cosmetic — they redraw the status page and the graphs. Daily
+  # is Upptime's default; `updates` and `updateTemplate` are pulled back to
+  # weekly because they only bump this repo's own dependencies.
+  responseTime: "0 23 * * *"
+  graphs: "0 0 * * *"
+  summary: "0 1 * * *"
+  staticSite: "0 1 * * *"
+  # `updates` AND `updateTemplate` ARE DELIBERATELY ABSENT, and their workflow
+  # files are not shipped. See uptime/.github/workflows/uptime.yml: those two
+  # jobs exist to regenerate the eight workflow files from upstream, which
+  # would DELETE the `permissions:` blocks this setup depends on. They also
+  # could not succeed — GITHUB_TOKEN has no `workflows` scope, so GitHub
+  # rejects any push touching .github/workflows. Scheduling them would buy a
+  # permanently red job and a config that erases itself the day a PAT appears.
+
+# ─── ONE OUTAGE, ONE NOTIFICATION ────────────────────────────────────────────
+# The anti-noise design, stated so it survives the next person to edit this:
+#
+#  1. Upptime retries a failing check TWICE more before it calls anything down
+#     (immediately, then +2s, then +10s). A single dropped packet never pages.
+#  2. A down transition opens exactly ONE GitHub issue and locks it. Later
+#     failing checks do NOT comment, do NOT reopen, and do NOT re-notify. The
+#     stream this project was told to avoid is not Upptime's default — the
+#     default is one issue per incident, closed automatically on recovery.
+#  3. `assignees` is the notification channel: GitHub emails the assignee when
+#     the issue opens and again when it closes. Two emails per outage, total.
+#     No SMTP server, no third-party mail API, no secret to rotate — and
+#     nothing in the path that Cloudflare can take down with it.
+#  4. `skipDeleteIssues` is LEFT AT ITS DEFAULT (false) on purpose: an
+#     incident that resolves inside 15 minutes has its issue deleted rather
+#     than archived, so a blip leaves no permanent scar on the incident log.
+assignees:
+  - Dazzer-Zefr
+
+# THE SECRET ALLOWLIST, EMPTY ON PURPOSE. Left unset, Upptime bakes a list of
+# ~100 notification secret names into every generated workflow's
+# SECRETS_CONTEXT. This monitor sends no notifications through Upptime — the
+# alert is the GitHub issue — so the allowlist is empty, SECRETS_CONTEXT
+# renders as `{}`, and no secret of any kind is passed to the monitor.
+secrets: []
+
+# This repo is a monitor, not a project: nothing here should be rewriting its
+# own description, topics or homepage on a schedule.
+skipDescriptionUpdate: true
+skipTopicsUpdate: true
+skipHomepageUpdate: true
 
 status-website:
-  # Add your custom domain name, or remove the `cname` line if you don't have a domain
-  # Uncomment the `baseUrl` line if you don't have a custom domain and add your repo name there
-  cname: demo.upptime.js.org
-  # baseUrl: /your-repo-name
-  logoUrl: https://raw.githubusercontent.com/upptime/upptime.js.org/master/static/img/icon.svg
-  name: Upptime
-  introTitle: "**Upptime** is the open-source uptime monitor and status page, powered entirely by GitHub."
-  introMessage: This is a sample status page which uses **real-time** data from our [GitHub repository](https://github.com/upptime/upptime). No server required — just GitHub Actions, Issues, and Pages. [**Get your own for free**](https://github.com/upptime/upptime)
+  name: Norm status
+  baseUrl: /norm-uptime
+  introTitle: "**Norm** platform status"
+  introMessage: >-
+    Checked hourly from GitHub Actions — deliberately outside Cloudflare, so
+    this page keeps reporting when the platform itself is down.
   navbar:
     - title: Status
       href: /
     - title: GitHub
       href: https://github.com/$OWNER/$REPO
-
-# Upptime also supports notifications, assigning issues, and more
-# See https://upptime.js.org/docs/configuration
